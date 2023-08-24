@@ -130,6 +130,8 @@ def knn_point(nsample, xyz, new_xyz):
 class LocalGrouper(nn.Module):
     def __init__(self, channel, groups, kneighbors, use_xyz=True, normalize="center", **kwargs):
         """
+        Grouping or clustering nearby points in a point cloud based on their spatial proximity
+        
         Give xyz[b,p,3] and fea[b,p,d], return new_xyz[b,g,3] and new_fea[b,g,k,d]
         :param groups: groups number
         :param kneighbors: k-nerighbors
@@ -158,6 +160,8 @@ class LocalGrouper(nn.Module):
 
         # fps_idx = torch.multinomial(torch.linspace(0, N - 1, steps=N).repeat(B, 1).to(xyz.device), num_samples=self.groups, replacement=False).long()
         # fps_idx = farthest_point_sample(xyz, self.groups).long()
+
+        # they have written a library in torch - C++, which is being imported here to do kmeans
         fps_idx = pointnet2_utils.furthest_point_sample(xyz, self.groups).long()  # [B, npoint]
         new_xyz = index_points(xyz, fps_idx)  # [B, npoint, 3]
         new_points = index_points(points, fps_idx)  # [B, npoint, d]
@@ -197,6 +201,10 @@ class ConvBNReLU1D(nn.Module):
 
 
 class ConvBNReLURes1D(nn.Module):
+    """
+    This implements a 1D resnet with skip connections.
+    mapping function can be written as a series of homogeneous residual MLP blocks, MLP (x) + x
+    """
     def __init__(self, channel, kernel_size=1, groups=1, res_expansion=1.0, bias=True, activation='relu'):
         super(ConvBNReLURes1D, self).__init__()
         self.act = get_activation(activation)
@@ -231,6 +239,7 @@ class PreExtraction(nn.Module):
     def __init__(self, channels, out_channels,  blocks=1, groups=1, res_expansion=1, bias=True,
                  activation='relu', use_xyz=True):
         """
+        Are residual point MLP blocks: the shared Φpre (·) is designed to learn shared weights from a local region
         input: [b,g,k,d]: output:[b,d,g]
         :param channels:
         :param blocks:
@@ -250,10 +259,10 @@ class PreExtraction(nn.Module):
         b, n, s, d = x.size()  # torch.Size([32, 512, 32, 6])
         x = x.permute(0, 1, 3, 2)
         x = x.reshape(-1, d, s)
-        x = self.transfer(x)
+        x = self.transfer(x)  # same as embedding
         batch_size, _, _ = x.size()
-        x = self.operation(x)  # [b, d, k]
-        x = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)
+        x = self.operation(x)  # [b, d, k]  ConvBNReLURes1D
+        x = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)  # aggregation function A (·) = max-pooling operation in the paper
         x = x.reshape(b, n, -1).permute(0, 2, 1)
         return x
 
@@ -261,6 +270,7 @@ class PreExtraction(nn.Module):
 class PosExtraction(nn.Module):
     def __init__(self, channels, blocks=1, groups=1, res_expansion=1, bias=True, activation='relu'):
         """
+        Φpos (·) is leveraged to extract deep aggregated features.
         input[b,d,g]; output[b,d,g]
         :param channels:
         :param blocks:
@@ -284,24 +294,25 @@ class Model(nn.Module):
                  k_neighbors=[32, 32, 32, 32], reducers=[2, 2, 2, 2], **kwargs):
         super(Model, self).__init__()
         self.stages = len(pre_blocks)
-        self.class_num = class_num
-        self.points = points
-        self.embedding = ConvBNReLU1D(3, embed_dim, bias=bias, activation=activation)
+        self.class_num = class_num  # each point belongs to a class
+        self.points = points  # reduce points to load to 1024
+        self.embedding = ConvBNReLU1D(3, embed_dim, bias=bias, activation=activation)  # conv1d as embedding layer
         assert len(pre_blocks) == len(k_neighbors) == len(reducers) == len(pos_blocks) == len(dim_expansion), \
             "Please check stage number consistent for pre_blocks, pos_blocks k_neighbors, reducers."
         self.local_grouper_list = nn.ModuleList()
         self.pre_blocks_list = nn.ModuleList()
         self.pos_blocks_list = nn.ModuleList()
-        last_channel = embed_dim
-        anchor_points = self.points
+        last_channel = embed_dim  
+        anchor_points = self.points  #
         for i in range(len(pre_blocks)):
-            out_channel = last_channel * dim_expansion[i]
+            out_channel = last_channel * dim_expansion[i]  # double output filters every block
             pre_block_num = pre_blocks[i]
             pos_block_num = pos_blocks[i]
             kneighbor = k_neighbors[i]
             reduce = reducers[i]
-            anchor_points = anchor_points // reduce
+            anchor_points = anchor_points // reduce  # halve input dimension
             # append local_grouper_list
+            # grouper prepares lists of groups that will be passed to pre and pos extraction using KNN
             local_grouper = LocalGrouper(last_channel, anchor_points, kneighbor, use_xyz, normalize)  # [b,g,k,d]
             self.local_grouper_list.append(local_grouper)
             # append pre_block_list
@@ -314,9 +325,10 @@ class Model(nn.Module):
                                              res_expansion=res_expansion, bias=bias, activation=activation)
             self.pos_blocks_list.append(pos_block_module)
 
-            last_channel = out_channel
+            last_channel = out_channel  # to keep building more blocks, update the last_channel number
 
-        self.act = get_activation(activation)
+        self.act = get_activation(activation)  # gets relu
+        # the MLP head for classification
         self.classifier = nn.Sequential(
             nn.Linear(last_channel, 512),
             nn.BatchNorm1d(512),
@@ -335,6 +347,7 @@ class Model(nn.Module):
         x = self.embedding(x)  # B,D,N
         for i in range(self.stages):
             # Give xyz[b, p, 3] and fea[b, p, d], return new_xyz[b, g, 3] and new_fea[b, g, k, d]
+            # gi = Φpos (A (Φpre (fi,j) , |j = 1, · · · , K))
             xyz, x = self.local_grouper_list[i](xyz, x.permute(0, 2, 1))  # [b,g,3]  [b,g,k,d]
             x = self.pre_blocks_list[i](x)  # [b,d,g]
             x = self.pos_blocks_list[i](x)  # [b,d,g]
