@@ -259,7 +259,7 @@ class PreExtraction(nn.Module):
         b, n, s, d = x.size()  # torch.Size([32, 512, 32, 6])
         x = x.permute(0, 1, 3, 2)
         x = x.reshape(-1, d, s)
-        x = self.transfer(x)  # same as embedding
+        x = self.transfer(x)  # same out channels as embedding ConvBNReLU1D
         batch_size, _, _ = x.size()
         x = self.operation(x)  # [b, d, k]  ConvBNReLURes1D
         x = F.adaptive_max_pool1d(x, 1).view(batch_size, -1)  # aggregation function A (·) = max-pooling operation in the paper
@@ -303,7 +303,7 @@ class Model(nn.Module):
         self.pre_blocks_list = nn.ModuleList()
         self.pos_blocks_list = nn.ModuleList()
         last_channel = embed_dim  
-        anchor_points = self.points  #
+        anchor_points = self.points  # number of groups that will be generated with KNN
         for i in range(len(pre_blocks)):
             out_channel = last_channel * dim_expansion[i]  # double output filters every block
             pre_block_num = pre_blocks[i]
@@ -345,11 +345,12 @@ class Model(nn.Module):
         xyz = x.permute(0, 2, 1)
         batch_size, _, _ = x.size()
         x = self.embedding(x)  # B,D,N
-        for i in range(self.stages):
+        for i in range(self.stages):  # 4 stages
             # Give xyz[b, p, 3] and fea[b, p, d], return new_xyz[b, g, 3] and new_fea[b, g, k, d]
             # gi = Φpos (A (Φpre (fi,j) , |j = 1, · · · , K))
             xyz, x = self.local_grouper_list[i](xyz, x.permute(0, 2, 1))  # [b,g,3]  [b,g,k,d]
             x = self.pre_blocks_list[i](x)  # [b,d,g]
+            # would've imagined the A to be here but its done in the pre_block itself.
             x = self.pos_blocks_list[i](x)  # [b,d,g]
 
         x = F.adaptive_max_pool1d(x, 1).squeeze(dim=-1)
